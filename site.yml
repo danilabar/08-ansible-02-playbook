@@ -29,6 +29,24 @@
           - clickhouse-client-{{ clickhouse_version }}.rpm
           - clickhouse-server-{{ clickhouse_version }}.rpm
       notify: Start clickhouse service
+# Настройка конфига clickhouse
+    - name: Deploy config clickhouse
+      ansible.builtin.template:
+        src: clickhouse.config.j2
+        dest: "{{ clickhouse_config_path }}"
+        mode: 0644
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+      become: true
+# Настройка конфига пользователей clickhouse
+    - name: Deploy users config clickhouse
+      ansible.builtin.template:
+        src: clickhouse.users.j2
+        dest: "{{ clickhouse_users_path }}"
+        mode: 0644
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+      become: true
 # Принудительное использование handlers для сарта сервиса clickhouse-server, иначе не получится создать БД
     - name: Flush handlers
       ansible.builtin.meta: flush_handlers
@@ -36,11 +54,21 @@
     - name: Delay 5 sec
       ansible.builtin.pause:
         seconds: 5
+# Создание БД для хранения логов
     - name: Create database
       ansible.builtin.command: "clickhouse-client -q 'create database logs;'"
       register: create_db
       failed_when: create_db.rc != 0 and create_db.rc !=82
       changed_when: create_db.rc == 0
+# Создание таблицы для хранения логов одной строкой
+    - name: Create table for logs
+      ansible.builtin.command: clickhouse-client -q
+                            'CREATE TABLE IF NOT EXISTS  logs.vector_internal_logs (
+                                message String
+                            )
+                            ENGINE = MergeTree()
+                            ORDER BY tuple();'
+      register: create_table
 
 - name: Install Vector
   hosts: vector
@@ -48,7 +76,7 @@
   handlers:
     - name: Start Vector service
       become: true
-      ansible.builtin.service:
+      ansible.builtin.systemd:
         name: vector
         state: restarted
 
@@ -58,17 +86,112 @@
       ansible.builtin.get_url:
         url: "https://packages.timber.io/vector/0.21.1/vector-0.21.1-1.{{ ansible_architecture }}.rpm"
         dest: "./vector-0.21.1-1.{{ ansible_architecture }}.rpm"
-        mode: 0755
+        mode: 0644
 # Установка rpm пакета vector
     - name: Install Vector packages
       become: true
       ansible.builtin.yum:
         name: vector-0.21.1-1.{{ ansible_architecture }}.rpm
+        state: present
       notify: Start Vector service
-# Создание файла конфигурации для vector. Сама конфигурация не претендует на рабочую, но пример взят с офф.документации vector
+# Создание файла конфигурации для vector.
     - name: Deploy config Vector
       ansible.builtin.template:
         src: vector.j2
-        dest: /etc/vector/vector.toml
-        mode: 0755
+        dest: "{{ vector_config_path }}"
+        mode: 0644
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        validate: vector validate --no-environment --config-yaml %s
+      become: true
       notify: Start Vector service
+# Создание каталога для sources local_logs, для чего-то требуется Vector-у, без него не стартует, хотя в каталог никаких данных не пишется
+    - name: Creates directory
+      become: true
+      file:
+        path: /var/lib/vector/local_logs
+        state: directory
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: 0644
+    - name: Create systemd unit Vector
+      become: true
+      template:
+        src: vector.service.j2
+        dest: /etc/systemd/system/vector.service
+        mode: 0644
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+    - name: Start Vector service
+      become: true
+      systemd:
+        name: vector
+        state: started
+        daemon_reload: true
+# Установка Nginx
+- name: Install Nginx
+  hosts: lighthouse
+  handlers:
+    - name: Start nginx service
+      become: true
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+  tasks:
+    - name: Install epel-release
+      become: true
+      yum:
+        name: epel-release
+        state: present
+    - name: Install Nginx
+      become: true
+      yum:
+        name: nginx
+        state: present
+      notify: Start nginx service
+    - name: Create Nginx config
+      become: true
+      template:
+        src: nginx.j2
+        dest: /etc/nginx/nginx.conf
+        mode: 0644
+      notify: Start nginx service
+# Установка lighthouse
+- name: Install lighthouse
+  hosts: lighthouse
+  handlers:
+    - name: Reload nginx service
+      become: true
+      command: nginx -s reload
+  pre_tasks:
+    - name: Install git
+      become: true
+      yum:
+        name: git
+        state: present
+  tasks:
+    - name: Copy lighthouse rfom git
+      git:
+        repo: "{{ lighthouse_vcs }}"
+        version: master
+        dest: "{{ lighthouse_dir }}"
+      become: true
+    - name: Create lighthouse config
+      become: true
+      template:
+        src: lighthouse.j2
+        dest: /etc/nginx/conf.d/default.conf
+        mode: 0644
+      notify: Reload nginx service
+# Для отладки на локальном окружении
+#  post_tasks:
+#    - name: Stop FW
+#      become: true
+#      ansible.builtin.service:
+#        name: firewalld
+#        state: stopped
+# Вывод строки для подключения к lighthouse
+  post_tasks:
+    - name: Show connect URL lighthouse
+      debug:
+        msg: "http://{{ ansible_host }}/#http://{{ hostvars['clickhouse-01'].ansible_host }}:8123/?user={{ clickhouse_user }}"
